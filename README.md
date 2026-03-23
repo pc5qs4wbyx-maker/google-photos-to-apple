@@ -79,6 +79,10 @@ For a 350GB library with a date filter that keeps roughly half the photos, you n
 
 See [INSTRUCTIONS.md](INSTRUCTIONS.md) for a full step-by-step walkthrough including external SSD setup, Google Takeout download tips, and troubleshooting.
 
+## Claude Cowork plugin
+
+If you use Claude's desktop app (Cowork mode), you can install the included `google-photos-to-apple.plugin` file for a guided interactive experience. Once installed, type `/transfer-photos` and Claude will walk you through the entire process step by step.
+
 ## License
 
 MIT
