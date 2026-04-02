@@ -131,13 +131,22 @@ Photos > Albums > Duplicates and merge any it finds.
 - If a download from Google fails partway through, just re-download that specific
   zip file. You don't need to restart the whole export.
 
-- If the script gets interrupted, you can re-run it. It will re-process everything
-  into the output folder. Files already there will be overwritten (not duplicated).
+- If the script gets interrupted, you can re-run it safely. It detects files already
+  in the output folder and avoids overwriting them (new files get a `_1`, `_2` suffix
+  instead). If you want a completely clean re-run, delete the output folder first.
 
 - The --skip-extract flag is useful if you already unzipped manually:
   ```
   python3 google_photos_to_apple.py /path/to/zips /path/to/output --before 2022-06 --skip-extract
   ```
+
+- If exiftool could not write metadata to some files, the script creates a
+  `_metadata_failures.txt` file in the output folder listing those files. The photos
+  are still there and will import fine — they just may not have restored metadata.
+
+- The source and output folders must not overlap (e.g. you cannot use the same folder
+  for both, or put the output inside the source folder). The script will exit with an
+  error if it detects this.
 
 ## What gets preserved
 

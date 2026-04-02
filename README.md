@@ -16,8 +16,12 @@ It is also useful for anyone who has tried Google Takeout and ended up with thou
 - Matches each photo/video to its companion JSON metadata file
 - Handles all of Google's naming conventions (old format, supplemental-metadata format, truncated filenames, duplicate numbering, edited files)
 - Writes date taken, GPS coordinates, descriptions, and favourites into EXIF data
+- Writes correct UTC timezone offsets so Apple Photos shows the right time
+- Recovers dates from filenames (e.g. `IMG_20220315_143022`) when JSON metadata is missing
 - Supports date filtering so you only transfer photos before (or after) a cutoff date
 - Picks up oversized videos that Google exports as standalone files outside the zips
+- Detects existing files in the output folder to avoid overwriting previous runs
+- Logs metadata failures to `_metadata_failures.txt` for easy re-processing
 - Produces a single folder you can drag into Apple Photos via File > Import
 
 ## Requirements
