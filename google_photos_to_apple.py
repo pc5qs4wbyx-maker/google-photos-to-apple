@@ -20,9 +20,12 @@ Usage:
 Author: pc5qs4wbyx-maker
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set
 
 
 # ---------------------------------------------------------------------------
@@ -51,17 +55,54 @@ MEDIA_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 # Files to skip entirely
 SKIP_FILES = {"metadata.json", "print-subscriptions.json", "shared_album_comments.json", "user-generated-memory-titles.json"}
 
+# Tunable constants
+TRUNCATED_FILENAME_PREFIX_LEN = 40
+PROGRESS_LOG_INTERVAL = 500
+EXIFTOOL_TIMEOUT_SECONDS = 30
+EXIFTOOL_ERROR_LOG_LIMIT = 20
+
+# Regex for extracting dates from common photo/video filenames
+_FILENAME_DATE_RE = re.compile(
+    r"(?:IMG|PXL|VID|MVIMG|Screenshot|PANO|BURST)?[_-]?"
+    r"(\d{4})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"
+    r"[_-]?(\d{2})(\d{2})(\d{2})"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def log(msg, level="INFO"):
+def log(msg: str, level: str = "INFO") -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {msg}")
 
 
-def find_json_for_media(media_path):
+def _safe_rmtree(path: Path) -> None:
+    """Remove a directory tree, logging a warning on failure instead of silently ignoring."""
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        log(f"Warning: could not fully clean up {path}: {e}", "WARN")
+        log("You may need to manually delete this directory to free disk space.", "WARN")
+
+
+def extract_date_from_filename(filename: str) -> Optional[datetime]:
+    """
+    Try to extract a date/time from common photo/video filename patterns.
+    Returns a timezone-aware (UTC) datetime or None.
+    """
+    m = _FILENAME_DATE_RE.search(filename)
+    if m:
+        try:
+            year, month, day, hour, minute, second = (int(g) for g in m.groups())
+            return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def find_json_for_media(media_path: Path) -> Optional[Path]:
     """
     Find the companion JSON metadata file for a given media file.
     Google uses several naming conventions:
@@ -75,7 +116,7 @@ def find_json_for_media(media_path):
     name = media_path.name
 
     # Strategy 1: Direct match -- name.json
-    candidates = [
+    candidates: List[Path] = [
         parent / f"{name}.json",
         parent / f"{name}.supplemental-metadata.json",
     ]
@@ -86,7 +127,6 @@ def find_json_for_media(media_path):
     # Strategy 3: Handle Google's duplicate numbering.
     # Google sometimes names files like: photo(1).jpg with JSON as photo.jpg(1).json
     # or photo(1).jpg.json
-    import re
     dup_match = re.match(r"^(.+?)(\(\d+\))(\.\w+)$", name)
     if dup_match:
         base, num, ext = dup_match.groups()
@@ -105,14 +145,16 @@ def find_json_for_media(media_path):
     # Strategy 5: Fuzzy match for truncated filenames.
     # If the media filename is long, Google may have truncated the JSON name.
     # Look for JSON files that start with a substantial prefix of our filename.
-    if len(name) > 40:
-        prefix = name[:40]
+    if len(name) > TRUNCATED_FILENAME_PREFIX_LEN:
+        prefix = name[:TRUNCATED_FILENAME_PREFIX_LEN]
         try:
             for f in parent.iterdir():
                 if f.suffix == ".json" and f.name.startswith(prefix) and f.name not in SKIP_FILES:
                     candidates.append(f)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
             pass
+        except OSError as e:
+            log(f"Warning: could not scan directory for truncated JSON matches: {e}", "WARN")
 
     # Strategy 6: Scan for any JSON whose "title" field matches our filename
     # (expensive, so only used as last resort below)
@@ -131,13 +173,15 @@ def find_json_for_media(media_path):
                         return f
                 except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError):
                     continue
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        log(f"Warning: could not scan directory for JSON title matches: {e}", "WARN")
 
     return None
 
 
-def parse_json_metadata(json_path):
+def parse_json_metadata(json_path: Path) -> Dict[str, Any]:
     """
     Extract useful metadata from a Google Takeout JSON sidecar file.
     Returns a dict with keys ready for exiftool arguments.
@@ -147,7 +191,7 @@ def parse_json_metadata(json_path):
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
-    metadata = {}
+    metadata: Dict[str, Any] = {}
 
     # Date/time taken
     photo_taken = data.get("photoTakenTime", {})
@@ -161,18 +205,22 @@ def parse_json_metadata(json_path):
         except (ValueError, OSError):
             pass
 
-    # GPS coordinates
+    # GPS coordinates -- use None-check (not == 0) to detect missing data,
+    # since 0.0 is valid for equator/prime meridian coordinates.
     geo = data.get("geoData", {})
-    if not geo or (geo.get("latitude", 0) == 0 and geo.get("longitude", 0) == 0):
+    lat = geo.get("latitude")
+    lon = geo.get("longitude")
+    # Fall back to geoDataExif only if geoData has no coordinates at all
+    if lat is None and lon is None:
         geo = data.get("geoDataExif", {})
+        lat = geo.get("latitude")
+        lon = geo.get("longitude")
 
-    lat = geo.get("latitude", 0)
-    lon = geo.get("longitude", 0)
-    alt = geo.get("altitude", 0)
-
-    if lat != 0 or lon != 0:
+    # Reject Null Island (0, 0) -- Google uses this as a placeholder for "no GPS"
+    if lat is not None and lon is not None and not (lat == 0.0 and lon == 0.0):
         metadata["latitude"] = lat
         metadata["longitude"] = lon
+        alt = geo.get("altitude", 0)
         if alt and alt != 0:
             metadata["altitude"] = alt
 
@@ -188,7 +236,7 @@ def parse_json_metadata(json_path):
     return metadata
 
 
-def build_exiftool_args(metadata, media_path):
+def build_exiftool_args(metadata: Dict[str, Any], media_path: Path) -> List[str]:
     """
     Build exiftool command-line arguments to write metadata into a media file.
     Uses different tags for photos vs videos.
@@ -200,17 +248,20 @@ def build_exiftool_args(metadata, media_path):
     if "date_taken" in metadata:
         dt = metadata["date_taken"]
         if is_video:
-            # Videos use QuickTime tags
+            # QuickTime CreateDate/ModifyDate are UTC by spec (no offset needed).
+            # Keys:CreationDate supports timezone, so append +00:00.
             args.extend([
                 f"-QuickTime:CreateDate={dt}",
                 f"-QuickTime:ModifyDate={dt}",
-                f"-Keys:CreationDate={dt}",
+                f"-Keys:CreationDate={dt}+00:00",
             ])
         else:
             args.extend([
                 f"-DateTimeOriginal={dt}",
                 f"-CreateDate={dt}",
                 f"-ModifyDate={dt}",
+                "-OffsetTimeOriginal=+00:00",
+                "-OffsetTime=+00:00",
             ])
         # Also set file modification date
         args.append(f"-FileModifyDate={dt}")
@@ -251,9 +302,9 @@ def build_exiftool_args(metadata, media_path):
     return args
 
 
-def find_all_media(search_dir):
+def find_all_media(search_dir: Path) -> List[Path]:
     """Walk a directory tree and find all media files."""
-    media_files = []
+    media_files: List[Path] = []
     for root, dirs, files in os.walk(search_dir):
         for f in files:
             fp = Path(root) / f
@@ -262,7 +313,7 @@ def find_all_media(search_dir):
     return media_files
 
 
-def check_exiftool():
+def check_exiftool() -> bool:
     """Verify exiftool is installed."""
     try:
         result = subprocess.run(
@@ -280,7 +331,15 @@ def check_exiftool():
     return False
 
 
-def process_media_files(media_files, output_dir, before_date, after_date, stats, used_names):
+def process_media_files(
+    media_files: List[Path],
+    output_dir: Path,
+    before_date: Optional[datetime],
+    after_date: Optional[datetime],
+    stats: Dict[str, int],
+    used_names: Set[str],
+    failed_metadata_files: List[str],
+) -> None:
     """
     Process a batch of media files:
       1. Find companion JSON for each
@@ -289,20 +348,29 @@ def process_media_files(media_files, output_dir, before_date, after_date, stats,
       4. Copy to output dir
       5. Write metadata with exiftool
 
-    Mutates stats and used_names in place. Returns nothing.
+    Mutates stats, used_names, and failed_metadata_files in place.
     """
     for i, media_path in enumerate(media_files, 1):
         file_num = stats["scanned"] + 1
         stats["scanned"] += 1
 
-        if file_num % 500 == 0 or file_num == 1:
+        if file_num % PROGRESS_LOG_INTERVAL == 0 or file_num == 1:
             log(f"Scanning file {file_num} (total processed so far: {stats['processed']}, skipped by date: {stats.get('skipped_by_date', 0)})...")
 
         # Find and parse JSON metadata
         json_path = find_json_for_media(media_path)
-        metadata = {}
+        metadata: Dict[str, Any] = {}
         if json_path:
             metadata = parse_json_metadata(json_path)
+
+        # Filename-based date fallback when JSON has no date
+        if "date_taken" not in metadata:
+            fallback_dt = extract_date_from_filename(media_path.name)
+            if fallback_dt:
+                metadata["date_taken"] = fallback_dt.strftime("%Y:%m:%d %H:%M:%S")
+                metadata["date_taken_utc"] = fallback_dt
+                metadata["date_from_filename"] = True
+                stats["date_from_filename"] += 1
 
         # Apply date filters
         if before_date or after_date:
@@ -346,16 +414,20 @@ def process_media_files(media_files, output_dir, before_date, after_date, stats,
                 try:
                     result = subprocess.run(
                         args,
-                        capture_output=True, text=True, timeout=30
+                        capture_output=True, text=True, timeout=EXIFTOOL_TIMEOUT_SECONDS
                     )
                     if result.returncode == 0:
                         stats["metadata_written"] += 1
                     else:
                         stats["exiftool_errors"] += 1
-                        if stats["exiftool_errors"] <= 5:
+                        failed_metadata_files.append(str(out_path))
+                        if stats["exiftool_errors"] <= EXIFTOOL_ERROR_LOG_LIMIT:
                             log(f"  exiftool warning for {out_name}: {result.stderr.strip()}", "WARN")
+                        elif stats["exiftool_errors"] == EXIFTOOL_ERROR_LOG_LIMIT + 1:
+                            log("  (further exiftool warnings suppressed; count will appear in summary)", "WARN")
                 except subprocess.TimeoutExpired:
                     stats["exiftool_errors"] += 1
+                    failed_metadata_files.append(str(out_path))
             else:
                 stats["no_useful_metadata"] += 1
         elif json_path and not metadata:
@@ -367,7 +439,7 @@ def process_media_files(media_files, output_dir, before_date, after_date, stats,
         stats["processed"] += 1
 
 
-def print_summary(stats, output_dir):
+def print_summary(stats: Dict[str, int], output_dir: Path) -> None:
     """Print a summary of what was processed."""
     print("\n" + "=" * 60)
     print("  TRANSFER COMPLETE")
@@ -377,6 +449,8 @@ def print_summary(stats, output_dir):
         print(f"  Skipped (outside date range):{stats['skipped_by_date']}")
     if stats.get('no_date_included_anyway', 0) > 0:
         print(f"  No date in metadata (kept):  {stats['no_date_included_anyway']}")
+    if stats.get('date_from_filename', 0) > 0:
+        print(f"  Date recovered from filename:{stats['date_from_filename']}")
     print(f"  Successfully processed:     {stats['processed']}")
     print(f"  Metadata restored:          {stats['metadata_written']}")
     print(f"  No JSON found (kept EXIF):  {stats.get('no_json_found', 0)}")
@@ -394,11 +468,30 @@ def print_summary(stats, output_dir):
     print()
 
 
+def _check_directory_overlap(source_dir: Path, output_dir: Path) -> None:
+    """Exit with an error if source and output directories overlap."""
+    if source_dir == output_dir:
+        log("Output directory must not be the same as source directory.", "ERROR")
+        sys.exit(1)
+    try:
+        output_dir.relative_to(source_dir)
+        log("Output directory must not be inside the source directory.", "ERROR")
+        sys.exit(1)
+    except ValueError:
+        pass
+    try:
+        source_dir.relative_to(output_dir)
+        log("Source directory must not be inside the output directory.", "ERROR")
+        sys.exit(1)
+    except ValueError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Transfer Google Photos Takeout to Apple Photos with full metadata.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -446,8 +539,10 @@ Examples:
         log(f"Source directory does not exist: {source_dir}", "ERROR")
         sys.exit(1)
 
+    _check_directory_overlap(source_dir, output_dir)
+
     # Parse date filters
-    def parse_date_arg(date_str):
+    def parse_date_arg(date_str: Optional[str]) -> Optional[datetime]:
         if not date_str:
             return None
         for fmt in ("%Y-%m-%d", "%Y-%m"):
@@ -470,8 +565,17 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Shared state across all zip batches
-    stats = defaultdict(int)
-    used_names = set()
+    stats: Dict[str, int] = defaultdict(int)
+    used_names: Set[str] = set()
+    failed_metadata_files: List[str] = []
+
+    # Seed used_names from existing files in output directory to avoid
+    # overwriting results from a previous partial run
+    for existing in output_dir.iterdir():
+        if existing.is_file():
+            used_names.add(existing.name.lower())
+    if used_names:
+        log(f"Output directory already contains {len(used_names)} file(s); new files will avoid name collisions.")
 
     if before_date:
         log(f"Date filter active: only media taken BEFORE {before_date.strftime('%B %Y')}")
@@ -487,7 +591,7 @@ Examples:
             log("No media files found.", "ERROR")
             sys.exit(1)
         log("Processing media and restoring metadata...")
-        process_media_files(media_files, output_dir, before_date, after_date, stats, used_names)
+        process_media_files(media_files, output_dir, before_date, after_date, stats, used_names, failed_metadata_files)
     else:
         # Incremental mode: process one zip at a time
         zip_files = sorted(source_dir.glob("*.zip"))
@@ -506,7 +610,7 @@ Examples:
             # Clean up any leftover temp directory from a previous interrupted run
             if temp_extract_dir.exists():
                 log(f"  Cleaning up leftover temp directory...")
-                shutil.rmtree(temp_extract_dir, ignore_errors=True)
+                _safe_rmtree(temp_extract_dir)
 
             # Extract this single zip
             temp_extract_dir.mkdir(parents=True, exist_ok=True)
@@ -516,7 +620,7 @@ Examples:
                     z.extractall(temp_extract_dir)
             except (zipfile.BadZipFile, Exception) as e:
                 log(f"  Warning: Could not extract {zf.name}: {e}", "WARN")
-                shutil.rmtree(temp_extract_dir, ignore_errors=True)
+                _safe_rmtree(temp_extract_dir)
                 continue
 
             # Find media files in the extracted content
@@ -525,11 +629,11 @@ Examples:
 
             if media_files:
                 # Process them (copy to output + fix metadata)
-                process_media_files(media_files, output_dir, before_date, after_date, stats, used_names)
+                process_media_files(media_files, output_dir, before_date, after_date, stats, used_names, failed_metadata_files)
 
             # Delete the extracted content to free disk space
             log(f"  Cleaning up extracted files...")
-            shutil.rmtree(temp_extract_dir, ignore_errors=True)
+            _safe_rmtree(temp_extract_dir)
 
             log(f"  Done with {zf.name}. Running totals: {stats['processed']} processed, {stats.get('skipped_by_date', 0)} skipped by date.")
 
@@ -543,7 +647,13 @@ Examples:
         if loose_media:
             log(f"")
             log(f"Found {len(loose_media)} loose media file(s) in source directory (oversized videos).")
-            process_media_files(loose_media, output_dir, before_date, after_date, stats, used_names)
+            process_media_files(loose_media, output_dir, before_date, after_date, stats, used_names, failed_metadata_files)
+
+    # Write metadata failure log if any
+    if failed_metadata_files:
+        failures_path = output_dir / "_metadata_failures.txt"
+        failures_path.write_text("\n".join(failed_metadata_files) + "\n", encoding="utf-8")
+        log(f"Wrote {len(failed_metadata_files)} metadata failure path(s) to {failures_path}")
 
     # Final summary
     print_summary(stats, output_dir)
